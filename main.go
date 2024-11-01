@@ -168,19 +168,16 @@ func main() {
 	// as these are the ones that need to be restored in a specific order
 	result := map[string]map[string]any{}
 	for _, res := range all {
-		owners := res.GetOwnerReferences()
-		if owners == nil {
-			continue
-		}
-		for i := range owners {
-			group := strings.Split(owners[i].APIVersion, "/")[0]
+		for i := range res.GetOwnerReferences() {
+			// need to get the group of the owner by splitting the APIVersion
+			group := strings.Split(res.GetOwnerReferences()[i].APIVersion, "/")[0]
 			// if group is contained in allGroups, then it is a CRD
 			if slices.Contains(allGroups, group) {
-				ownedBy := owners[i].Kind
-				kind := res.GetKind()
-				entry := map[string]any{}
-				entry[ownedBy] = nil
-				result[kind] = entry
+				// for every owner reference, add the resource to the map
+				// so we can track the dependencies
+				result[res.GetKind()] = map[string]any{
+					res.GetOwnerReferences()[i].Kind: nil,
+				}
 			}
 		}
 	}
@@ -207,7 +204,7 @@ func main() {
 
 	// add final order to end of default order
 	v := append(defaultOrder, final...)
-	fmt.Printf("%s=%s", restoreFlag, strings.Join(v, ","))
+	fmt.Printf("%s=%s\n", restoreFlag, strings.Join(v, ","))
 }
 
 // findAll finds all resources of given CRDs
