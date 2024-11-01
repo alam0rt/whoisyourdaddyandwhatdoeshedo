@@ -31,16 +31,22 @@ var (
 	}
 )
 
-func getRes(in unstructured.Unstructured) (schema.GroupVersionResource, bool, error) {
+type GVK struct {
+	GVR  schema.GroupVersionResource
+	Kind string
+}
+
+func getRes(in unstructured.Unstructured) (GVK, bool, error) {
 	if in.DeepCopy() == nil {
-		return schema.GroupVersionResource{}, false, fmt.Errorf("cannot get resource from nil object")
+		return GVK{}, false, fmt.Errorf("cannot get resource from nil object")
 	}
 
 	if in.GetKind() != "CustomResourceDefinition" {
-		return schema.GroupVersionResource{}, false, fmt.Errorf("cannot get resource from non-CRD object %s", in.GetKind())
+		return GVK{}, false, fmt.Errorf("cannot get resource from non-CRD object %s", in.GetKind())
 	}
 
 	group := in.Object["spec"].(map[string]interface{})["group"].(string)
+	kind := in.Object["spec"].(map[string]interface{})["names"].(map[string]interface{})["kind"].(string)
 	plural := in.Object["spec"].(map[string]interface{})["names"].(map[string]interface{})["plural"].(string)
 	versionsSpec := in.Object["spec"].(map[string]interface{})["versions"].([]interface{})
 	versions := []string{}
@@ -50,10 +56,13 @@ func getRes(in unstructured.Unstructured) (schema.GroupVersionResource, bool, er
 	}
 	namespaced := in.Object["spec"].(map[string]interface{})["scope"].(string) == "Namespaced"
 
-	return schema.GroupVersionResource{
-		Group:    group,
-		Version:  versions[len(versions)-1], // last version is the most recent
-		Resource: plural,
+	return GVK{
+		GVR: schema.GroupVersionResource{
+			Group:    group,
+			Version:  versions[len(versions)-1], // last version is the most recent
+			Resource: plural,
+		},
+		Kind: kind,
 	}, namespaced, nil
 }
 
@@ -101,17 +110,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	allGroups := map[string]schema.GroupVersionResource{}
+	allGroups := []string{}
+	kindToGK := map[string]string{}
 	for _, crd := range crds.Items {
 		res, _, err := getRes(crd)
 		if err != nil {
 			slog.Error("cannot get resource", "error", err)
 			os.Exit(1)
 		}
-		allGroups[res.Group] = res
+		kindToGK[res.Kind] = crd.GetName()
+		allGroups = append(allGroups, res.GVR.GroupResource().Group)
 	}
 
-	slog.Info("CRDs", "kinds", allGroups)
+	slog.Info("CRDs", "kinds", kindToGK)
 
 	// get every custom resource
 	all, err := findAll(ctx, crds, clientset)
@@ -129,7 +140,7 @@ func main() {
 		for i := range owners {
 			group := strings.Split(owners[i].APIVersion, "/")[0]
 			// if group is contained in allGroups, then it is a CRD
-			if _, ok := allGroups[group]; ok {
+			if slices.Contains(allGroups, group) {
 				ownedBy := owners[i].Kind
 				kind := res.GetKind()
 				entry := map[string]any{}
@@ -143,33 +154,40 @@ func main() {
 	// and resources that are owned by other resources are at the bottom
 	// e.g. IAMRoles are owned by Nodegroups which are in turn owned by NodegroupDeployments
 	// so the order should be NodegroupDeployments -> Nodegroups -> IAMRoles
-	fmt.Println(strings.Join(orderDependencies(result), ", "))
+	final := []string{}
+	ordered := orderDependencies(result)
+	for _, depend := range ordered {
+		gk := kindToGK[depend]
+		if gk != "" {
+			final = append(final, gk)
+		}
+	}
+	fmt.Printf("Order: %s\n", strings.Join(ordered, ","))
+	slog.Info("Final order", "order", ordered, "count", len(ordered))
+	slog.Info("Final order", "final", final, "count", len(final))
 }
 
 func findAll(ctx context.Context, crds *unstructured.UnstructuredList, clientset dynamic.Interface) ([]unstructured.Unstructured, error) {
 	allResources := []unstructured.Unstructured{}
-	wg := sync.WaitGroup{}
 	if crds == nil {
 		return nil, fmt.Errorf("cannot find resources from nil object")
 	}
+	wg := sync.WaitGroup{}
+	wg.Add(len(crds.Items))
 	for _, crd := range crds.Items {
-		wg.Add(1)
 		go func(crd unstructured.Unstructured) {
 			defer wg.Done()
 
-			name := crd.GetName()
 			res, namespaced, err := getRes(crd)
 			if err != nil {
 				return
 			}
 			var list func(context.Context, v1.ListOptions) (*unstructured.UnstructuredList, error)
 			if namespaced {
-				list = clientset.Resource(res).Namespace("").List
+				list = clientset.Resource(res.GVR).Namespace("").List
 			} else {
-				list = clientset.Resource(res).List
+				list = clientset.Resource(res.GVR).List
 			}
-
-			slog.Info("CRD", "name", name, "resource", res)
 
 			// get all resources of this type
 			resources, err := list(ctx, v1.ListOptions{})
@@ -180,6 +198,8 @@ func findAll(ctx context.Context, crds *unstructured.UnstructuredList, clientset
 			if apierrors.IsNotFound(err) {
 				return
 			}
+
+			slog.Info("found resources", "kind", res.Kind, "count", len(resources.Items))
 
 			allResources = append(allResources, resources.Items...)
 		}(crd)
@@ -214,9 +234,9 @@ func orderDependencies(data map[string]map[string]any) []string {
 	result := []string{}
 	for _, idx := range order {
 		result = append(result, flipped[idx]...)
-
 	}
+
 	slices.Reverse(result)
 
-	return nil
+	return result
 }
