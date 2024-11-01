@@ -111,18 +111,18 @@ func main() {
 	}
 
 	allGroups := []string{}
-	kindToGK := map[string]string{}
+	crdToKind := map[string]string{}
 	for _, crd := range crds.Items {
 		res, _, err := getRes(crd)
 		if err != nil {
 			slog.Error("cannot get resource", "error", err)
 			os.Exit(1)
 		}
-		kindToGK[res.Kind] = crd.GetName()
+		crdToKind[crd.GetName()] = res.Kind
 		allGroups = append(allGroups, res.GVR.GroupResource().Group)
 	}
 
-	slog.Info("CRDs", "kinds", kindToGK)
+	slog.Info("CRDs", "kinds", crdToKind)
 
 	// get every custom resource
 	all, err := findAll(ctx, crds, clientset)
@@ -157,14 +157,39 @@ func main() {
 	final := []string{}
 	ordered := orderDependencies(result)
 	for _, depend := range ordered {
-		gk := kindToGK[depend]
-		if gk != "" {
-			final = append(final, gk)
+		for k, v := range crdToKind {
+			if v == depend {
+				final = append(final, k)
+			}
 		}
 	}
 	fmt.Printf("Order: %s\n", strings.Join(ordered, ","))
 	slog.Info("Final order", "order", ordered, "count", len(ordered))
 	slog.Info("Final order", "final", final, "count", len(final))
+
+	// https://velero.io/docs/v1.15/restore-reference/#restore-order
+	defaultOrder := []string{
+		"customresourcedefinitions",
+		"namespaces,storageclasses",
+		"volumesnapshotclass.snapshot.storage.k8s.io",
+		"volumesnapshotcontents.snapshot.storage.k8s.io",
+		"volumesnapshots.snapshot.storage.k8s.io",
+		"persistentvolumes,persistentvolumeclaims",
+		"secrets",
+		"configmaps",
+		"serviceaccounts",
+		"limitranges",
+		"pods",
+		"replicasets.apps",
+		"clusters.cluster.x-k8s.io",
+		"clusterresourcesets.addons.cluster.x-k8s.io",
+	}
+
+	flag := "--restore-resource-priorities="
+
+	// add final order to end of default order
+	v := append(defaultOrder, final...)
+	fmt.Println(fmt.Sprintf("%s%s", flag, strings.Join(v, ",")))
 }
 
 func findAll(ctx context.Context, crds *unstructured.UnstructuredList, clientset dynamic.Interface) ([]unstructured.Unstructured, error) {
@@ -235,8 +260,6 @@ func orderDependencies(data map[string]map[string]any) []string {
 	for _, idx := range order {
 		result = append(result, flipped[idx]...)
 	}
-
-	slices.Reverse(result)
 
 	return result
 }
