@@ -23,6 +23,30 @@ import (
 	"k8s.io/client-go/util/homedir"
 )
 
+var ignoreGroups = []string{
+	"iam.aws.zendesk.com",
+}
+
+const restoreFlag = `--restore-resource-priorities`
+
+// https://velero.io/docs/v1.15/restore-reference/#restore-order
+var defaultOrder = []string{
+	"customresourcedefinitions",
+	"namespaces,storageclasses",
+	"volumesnapshotclass.snapshot.storage.k8s.io",
+	"volumesnapshotcontents.snapshot.storage.k8s.io",
+	"volumesnapshots.snapshot.storage.k8s.io",
+	"persistentvolumes,persistentvolumeclaims",
+	"secrets",
+	"configmaps",
+	"serviceaccounts",
+	"limitranges",
+	"pods",
+	"replicasets.apps",
+	"clusters.cluster.x-k8s.io",
+	"clusterresourcesets.addons.cluster.x-k8s.io",
+}
+
 var (
 	crdRes schema.GroupVersionResource = schema.GroupVersionResource{
 		Group:    "apiextensions.k8s.io",
@@ -36,6 +60,7 @@ type GVK struct {
 	Kind string
 }
 
+// for a custom resource, get its GVK and whether it is namespaced
 func getRes(in unstructured.Unstructured) (GVK, bool, error) {
 	if in.DeepCopy() == nil {
 		return GVK{}, false, fmt.Errorf("cannot get resource from nil object")
@@ -110,6 +135,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// all groups contained in CRDs
 	allGroups := []string{}
 	crdToKind := map[string]string{}
 	for _, crd := range crds.Items {
@@ -118,11 +144,18 @@ func main() {
 			slog.Error("cannot get resource", "error", err)
 			os.Exit(1)
 		}
+		if slices.Contains(ignoreGroups, res.GVR.Group) {
+			continue
+		}
+
+		// a mapping of CRD names to the kinds exposed
+		// (required because owner references are in the form of kind and need to be mapped to CRD names)
+		// e.g. foo.bar.com -> Foo
 		crdToKind[crd.GetName()] = res.Kind
+
+		// all groups contained in CRDs
 		allGroups = append(allGroups, res.GVR.GroupResource().Group)
 	}
-
-	slog.Info("CRDs", "kinds", crdToKind)
 
 	// get every custom resource
 	all, err := findAll(ctx, crds, clientset)
@@ -131,6 +164,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	// get all resources that have owners
+	// as these are the ones that need to be restored in a specific order
 	result := map[string]map[string]any{}
 	for _, res := range all {
 		owners := res.GetOwnerReferences()
@@ -158,40 +193,24 @@ func main() {
 	ordered := orderDependencies(result)
 	for _, depend := range ordered {
 		for k, v := range crdToKind {
+			if result[v] == nil {
+				// remove any resources that are not in the CRD list
+				// as these do not have owners and thus will get restored
+				// after.
+				continue
+			}
 			if v == depend {
 				final = append(final, k)
 			}
 		}
 	}
-	fmt.Printf("Order: %s\n", strings.Join(ordered, ","))
-	slog.Info("Final order", "order", ordered, "count", len(ordered))
-	slog.Info("Final order", "final", final, "count", len(final))
-
-	// https://velero.io/docs/v1.15/restore-reference/#restore-order
-	defaultOrder := []string{
-		"customresourcedefinitions",
-		"namespaces,storageclasses",
-		"volumesnapshotclass.snapshot.storage.k8s.io",
-		"volumesnapshotcontents.snapshot.storage.k8s.io",
-		"volumesnapshots.snapshot.storage.k8s.io",
-		"persistentvolumes,persistentvolumeclaims",
-		"secrets",
-		"configmaps",
-		"serviceaccounts",
-		"limitranges",
-		"pods",
-		"replicasets.apps",
-		"clusters.cluster.x-k8s.io",
-		"clusterresourcesets.addons.cluster.x-k8s.io",
-	}
-
-	flag := "--restore-resource-priorities="
 
 	// add final order to end of default order
 	v := append(defaultOrder, final...)
-	fmt.Println(fmt.Sprintf("%s%s", flag, strings.Join(v, ",")))
+	fmt.Printf("%s=%s", restoreFlag, strings.Join(v, ","))
 }
 
+// findAll finds all resources of given CRDs
 func findAll(ctx context.Context, crds *unstructured.UnstructuredList, clientset dynamic.Interface) ([]unstructured.Unstructured, error) {
 	allResources := []unstructured.Unstructured{}
 	if crds == nil {
@@ -207,6 +226,8 @@ func findAll(ctx context.Context, crds *unstructured.UnstructuredList, clientset
 			if err != nil {
 				return
 			}
+
+			// get all resources whether they are namespaced or not
 			var list func(context.Context, v1.ListOptions) (*unstructured.UnstructuredList, error)
 			if namespaced {
 				list = clientset.Resource(res.GVR).Namespace("").List
